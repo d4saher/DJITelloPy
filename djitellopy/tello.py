@@ -5,6 +5,7 @@
 import logging
 import socket
 import time
+import keyboard
 from collections import deque
 from threading import Thread, Lock
 from typing import Optional, Union, Type, Dict
@@ -99,44 +100,45 @@ class Tello:
 
     def __init__(self,
                  host=TELLO_IP,
-                 retry_count=RETRY_COUNT,
-                 vs_udp=VS_UDP_PORT):
+                 control_udp=CONTROL_UDP_PORT,
+                 state_udp=STATE_UDP_PORT,
+                 vs_udp=VS_UDP_PORT,
+                 retry_count=RETRY_COUNT):
 
         global threads_initialized, client_socket, drones
-
-        self.address = (host, Tello.CONTROL_UDP_PORT)
+        self.address = (host, control_udp)
+        self.state_udp_port = state_udp
+        self.vs_udp_port = vs_udp
         self.stream_on = False
         self.retry_count = retry_count
         self.last_received_command_timestamp = time.time()
         self.last_rc_control_timestamp = time.time()
+        self.interrupt_signal = False
 
         if not threads_initialized:
             # Run Tello command responses UDP receiver on background
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            client_socket.bind(("", Tello.CONTROL_UDP_PORT))
+            client_socket.bind(("", self.address[1]))
             response_receiver_thread = Thread(target=Tello.udp_response_receiver)
             response_receiver_thread.daemon = True
             response_receiver_thread.start()
 
             # Run state UDP receiver on background
-            state_receiver_thread = Thread(target=Tello.udp_state_receiver)
+            state_receiver_thread = Thread(target=Tello.udp_state_receiver, args=(self,))
             state_receiver_thread.daemon = True
             state_receiver_thread.start()
 
             threads_initialized = True
 
-        drones[host] = {'responses': [], 'state': {}}
+        drones[self.address[0]] = {'responses': [], 'state': {}}
 
-        self.LOGGER.info("Tello instance was initialized. Host: '{}'. Port: '{}'.".format(host, Tello.CONTROL_UDP_PORT))
+        self.LOGGER.info("Tello instance was initialized. Host: '{}'. Port: '{}'.".format(host, self.address[1])) 
 
-        self.vs_udp_port = vs_udp
-
-
-    def change_vs_udp(self, udp_port):
+    def change_vs_udp(self, vs_udp_port):
         """Change the UDP Port for sending video feed from the drone.
         """
-        self.vs_udp_port = udp_port
-        self.send_control_command(f'port 8890 {self.vs_udp_port}')
+        self.vs_udp_port = vs_udp_port
+        self.send_control_command(f'port {self.state_udp_port} {self.vs_udp_port}')
 
     def get_own_udp_object(self):
         """Get own object from the global drones dict. This object is filled
@@ -171,14 +173,16 @@ class Tello:
                 break
 
     @staticmethod
-    def udp_state_receiver():
+    def udp_state_receiver(tello_instance):
         """Setup state UDP receiver. This method listens for state information from
         Tello. Must be run from a background thread in order to not block
         the main thread.
         Internal method, you normally wouldn't call this yourself.
         """
         state_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        state_socket.bind(("", Tello.STATE_UDP_PORT))
+        state_socket.bind(("", tello_instance.get_udp_state_port()))
+
+        tello_instance.LOGGER.info('State socket bound to {}'.format(tello_instance.get_udp_state_port()))
 
         while True:
             try:
@@ -248,6 +252,15 @@ class Tello:
             return state[key]
         else:
             raise TelloException('Could not get state property: {}'.format(key))
+
+    def listen_for_abort(self):
+        print("Press 'Esc' to interrupt the command...")
+        while True:
+            if keyboard.is_pressed('esc'):  # You can change 'esc' to any key you prefer
+                self.interrupt_signal = True
+                print("Abort signal received. Interrupting the current command...")
+                break  # Breaking the loop after abort to avoid multiple triggers
+            time.sleep(0.1)  # Small delay to prevent high CPU usage
 
     def get_mission_pad_id(self) -> int:
         """Mission pad ID of the currently detected mission pad
@@ -403,6 +416,16 @@ class Tello:
             int: 0-100
         """
         return self.get_state_field('bat')
+    
+    def get_udp_port(self) -> int:
+        """Internal method, you normally wouldn't call this yourself.
+        """
+        return self.address[1]
+    
+    def get_udp_state_port(self) -> int:
+        """Internal method, you normally wouldn't call this yourself.
+        """
+        return self.state_udp_port
 
     def get_udp_video_address(self) -> str:
         """Internal method, you normally wouldn't call this youself.
@@ -444,10 +467,27 @@ class Tello:
         responses = self.get_own_udp_object()['responses']
 
         while not responses:
+            if self.interrupt_signal:
+                self.interrupt_signal = False  # Reset interrupt signal
+                self.land()
+                return "Command aborted by user."
             if time.time() - timestamp > timeout:
-                message = "Aborting command '{}'. Did not receive a response after {} seconds".format(command, timeout)
-                self.LOGGER.warning(message)
-                return message
+                self.LOGGER.info("Timeout reached, checking drone connectivity...")
+                connectivity_check = self.send_command_with_return("command", timeout=5)
+                if "ok" in connectivity_check.lower():
+                    message = "Drone is still operational but did not respond to '{}'. Waiting longer...".format(command)
+                    self.LOGGER.info(message)
+                    timeout += 10  # Extend the timeout, or handle as appropriate
+                    timestamp = time.time()  # Reset the timestamp for extended waiting
+                elif "error" in connectivity_check.lower():
+                    message = "Drone is not operational. Aborting command '{}'.".format(command)
+                    self.LOGGER.error(message)
+                    return message
+                else:
+                    message = "No response from drone on connectivity check. Aborting command '{}'."
+                    self.LOGGER.error(message.format(command))
+                    return message.format(command)
+        
             time.sleep(0.1)  # Sleep during send command
 
         self.last_received_command_timestamp = time.time()
@@ -482,8 +522,9 @@ class Tello:
 
             if 'ok' in response.lower():
                 return True
-
-            self.LOGGER.debug("Command attempt #{} failed for command: '{}'".format(i, command))
+            elif 'error' in response.lower():
+                self.LOGGER.error("Command attempt #{} failed for command: '{}'".format(i, command))
+                return False
 
         self.raise_result_error(command, response)
         return False # never reached
